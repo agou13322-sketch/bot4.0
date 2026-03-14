@@ -1,9 +1,8 @@
-import requests
 import asyncio
 import time
 import re
+import requests
 from collections import defaultdict
-from langdetect import detect
 
 from telegram import Update
 from telegram.ext import (
@@ -13,210 +12,202 @@ from telegram.ext import (
     filters
 )
 
-# =====================
+from langdetect import detect
+
+# ======================
 # 配置
-# =====================
+# ======================
 
 TELEGRAM_TOKEN = "8387363153:AAFKBHEPDJor5vsTGMM1rrshZU2VYdxw11c"
 
-MERGE_TIME = 3
-REQUEST_INTERVAL = 1
-
-# =====================
-# 缓存
-# =====================
-
+# 翻译缓存
 translate_cache = {}
-last_request_time = {}
 
+# 消息缓冲（用于合并翻译）
 message_buffer = defaultdict(list)
-buffer_tasks = {}
 
-# =====================
-# 工具函数
-# =====================
+# 缓冲时间（秒）
+BUFFER_TIME = 2
 
-def is_valid_text(text):
 
-    if not text:
-        return False
+# ======================
+# 判断是否纯表情
+# ======================
 
-    text = text.strip()
-
-    if len(text) < 2:
-        return False
-
+def is_emoji_only(text):
     emoji_pattern = re.compile(
         "["
         "\U0001F600-\U0001F64F"
         "\U0001F300-\U0001F5FF"
         "\U0001F680-\U0001F6FF"
+        "\U0001F1E0-\U0001F1FF"
         "]+",
-        flags=re.UNICODE
+        flags=re.UNICODE,
     )
 
-    if emoji_pattern.fullmatch(text):
-        return False
-
-    return True
+    cleaned = emoji_pattern.sub("", text)
+    return cleaned.strip() == ""
 
 
-def rate_limit(user_id):
-
-    now = time.time()
-
-    if user_id in last_request_time:
-        if now - last_request_time[user_id] < REQUEST_INTERVAL:
-            return False
-
-    last_request_time[user_id] = now
-
-    return True
-
-
-def detect_language(text):
-
-    try:
-        lang = detect(text)
-    except:
-        return None
-
-    if lang.startswith("zh"):
-        return "zh"
-
-    if lang == "vi":
-        return "vi"
-
-    return None
-
-
-# =====================
-# 翻译
-# =====================
+# ======================
+# 翻译函数
+# ======================
 
 def translate(text, target):
 
-    if text in translate_cache:
-        return translate_cache[text]
+    # 缓存命中
+    cache_key = text + "_" + target
+    if cache_key in translate_cache:
+        return translate_cache[cache_key]
 
-    url = "https://libretranslate.de/translate"
+    # 主翻译 API
+    try:
+        url = "https://translate.argosopentech.com/translate"
 
-    payload = {
-        "q": text,
-        "source": "auto",
-        "target": target,
-        "format": "text"
-    }
+        payload = {
+            "q": text,
+            "source": "auto",
+            "target": target,
+            "format": "text"
+        }
 
-    r = requests.post(url, json=payload)
+        r = requests.post(url, data=payload, timeout=8)
 
-    translated = r.json()["translatedText"]
+        if r.status_code == 200:
+            data = r.json()
 
-    translate_cache[text] = translated
+            if "translatedText" in data:
+                result = data["translatedText"]
+                translate_cache[cache_key] = result
+                return result
 
-    return translated
+    except:
+        pass
+
+    # 备用 API
+    try:
+        url = "https://libretranslate.de/translate"
+
+        payload = {
+            "q": text,
+            "source": "auto",
+            "target": target,
+            "format": "text"
+        }
+
+        r = requests.post(url, data=payload, timeout=8)
+
+        if r.status_code == 200:
+            data = r.json()
+
+            if "translatedText" in data:
+                result = data["translatedText"]
+                translate_cache[cache_key] = result
+                return result
+
+    except:
+        pass
+
+    return text
 
 
-# =====================
-# 合并翻译
-# =====================
+# ======================
+# 消息处理
+# ======================
 
-async def process_buffer(chat_id):
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    await asyncio.sleep(MERGE_TIME)
+    msg = update.message
 
-    messages = message_buffer[chat_id]
-
-    if not messages:
+    if not msg.text:
         return
 
-    combined_text = "\n".join([m["text"] for m in messages])
+    text = msg.text.strip()
 
-    lang = detect_language(combined_text)
-
-    if lang == "zh":
-        translated = translate(combined_text, "vi")
-
-    elif lang == "vi":
-        translated = translate(combined_text, "zh")
-
-    else:
-        message_buffer[chat_id] = []
+    if is_emoji_only(text):
         return
 
-    first_message = messages[0]["message"]
+    chat_id = msg.chat_id
 
-    await first_message.reply_text(
-        translated,
-        reply_to_message_id=first_message.message_id
-    )
-
-    message_buffer[chat_id] = []
+    message_buffer[chat_id].append((msg, text))
 
 
-# =====================
-# 主逻辑
-# =====================
+# ======================
+# 消息缓冲处理
+# ======================
 
-async def translate_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def process_buffer(app):
 
-    message = update.message
+    while True:
 
-    if not message:
-        return
+        await asyncio.sleep(BUFFER_TIME)
 
-    if message.photo or message.video or message.sticker or message.document:
-        return
+        for chat_id in list(message_buffer.keys()):
 
-    text = message.text
+            if not message_buffer[chat_id]:
+                continue
 
-    if not is_valid_text(text):
-        return
+            items = message_buffer[chat_id]
+            message_buffer[chat_id] = []
 
-    user_id = message.from_user.id
-    chat_id = message.chat_id
+            texts = []
+            msgs = []
 
-    if not rate_limit(user_id):
-        return
+            for msg, text in items:
+                texts.append(text)
+                msgs.append(msg)
 
-    lang = detect_language(text)
+            combined_text = "\n".join(texts)
 
-    if lang not in ["zh", "vi"]:
-        return
+            try:
+                lang = detect(combined_text)
+            except:
+                continue
 
-    message_buffer[chat_id].append({
-        "text": text,
-        "message": message
-    })
+            # 中文 -> 越南语
+            if lang.startswith("zh"):
+                translated = translate(combined_text, "vi")
 
-    if chat_id not in buffer_tasks:
+            # 越南语 -> 中文
+            elif lang == "vi":
+                translated = translate(combined_text, "zh")
 
-        buffer_tasks[chat_id] = asyncio.create_task(
-            process_buffer(chat_id)
-        )
+            else:
+                continue
 
-        def done_callback(task):
-            buffer_tasks.pop(chat_id, None)
+            # 拆分翻译
+            results = translated.split("\n")
 
-        buffer_tasks[chat_id].add_done_callback(done_callback)
+            for i, msg in enumerate(msgs):
+
+                if i >= len(results):
+                    continue
+
+                try:
+                    await msg.reply_text(
+                        results[i],
+                        reply_to_message_id=msg.message_id
+                    )
+                except:
+                    pass
 
 
-# =====================
-# 启动
-# =====================
+# ======================
+# 主函数
+# ======================
 
-def main():
-
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-    app.add_handler(
-        MessageHandler(filters.TEXT & (~filters.COMMAND), translate_handler)
-    )
+async def main():
 
     print("Free AI Translate Bot Running...")
 
-    app.run_polling()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+
+    asyncio.create_task(process_buffer(app))
+
+    await app.run_polling()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
