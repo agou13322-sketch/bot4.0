@@ -1,38 +1,63 @@
-import asyncio
 import time
-from collections import defaultdict
+import re
 
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    MessageHandler,
-    CommandHandler,
-    ContextTypes,
-    filters
-)
-
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
 from langdetect import detect
-import openai
+import baidu_translate_api as translate
 
-TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-OPENAI_API_KEY = "YOUR_OPENAI_KEY"
-
-openai.api_key = OPENAI_API_KEY
+TELEGRAM_TOKEN = ""
 
 bot_enabled = True
+
+# 防刷限制
+last_request_time = {}
+REQUEST_INTERVAL = 1.2
 
 # 用户语言缓存
 user_lang_cache = {}
 
-# 防刷
-last_request_time = {}
-REQUEST_INTERVAL = 1.5
+# 翻译缓存（提高速度）
+translate_cache = {}
 
-# 消息合并缓存
-message_buffer = defaultdict(list)
-buffer_tasks = {}
 
-MERGE_TIME = 3  # 秒
+def is_valid_text(text):
+    if not text:
+        return False
+
+    # 忽略只有表情或符号的消息
+    text = text.strip()
+
+    if len(text) < 2:
+        return False
+
+    # 如果只有表情符号
+    emoji_pattern = re.compile(
+        "["
+        "\U0001F600-\U0001F64F"
+        "\U0001F300-\U0001F5FF"
+        "\U0001F680-\U0001F6FF"
+        "\U0001F1E0-\U0001F1FF"
+        "]+",
+        flags=re.UNICODE,
+    )
+
+    if emoji_pattern.fullmatch(text):
+        return False
+
+    return True
+
+
+def rate_limit(user_id):
+
+    now = time.time()
+
+    if user_id in last_request_time:
+        if now - last_request_time[user_id] < REQUEST_INTERVAL:
+            return False
+
+    last_request_time[user_id] = now
+    return True
 
 
 def detect_language(user_id, text):
@@ -56,87 +81,52 @@ def detect_language(user_id, text):
     return lang
 
 
-def rate_limit(user_id):
+def translate_text(text, lang):
 
-    now = time.time()
+    # 翻译缓存
+    if text in translate_cache:
+        return translate_cache[text]
 
-    if user_id in last_request_time:
-        if now - last_request_time[user_id] < REQUEST_INTERVAL:
-            return False
+    if lang == "zh":
+        result = translate.translate(text, to="vie")
+        translated = result["trans_result"]["dst"]
+        label = "🇻🇳 越南语"
 
-    last_request_time[user_id] = now
-    return True
+    elif lang == "vi":
+        result = translate.translate(text, to="zh")
+        translated = result["trans_result"]["dst"]
+        label = "🇨🇳 中文"
 
+    else:
+        return None, None
 
-def ai_translate(text):
+    translate_cache[text] = (translated, label)
 
-    prompt = f"""
-你是专业翻译助手。
-
-规则：
-1. 中文翻译成越南语
-2. 越南语翻译成中文
-3. 保持自然表达
-4. 只输出翻译结果
-
-文本：
-{text}
-"""
-
-    response = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    return response['choices'][0]['message']['content'].strip()
+    return translated, label
 
 
-async def process_buffer(chat_id, context):
-
-    await asyncio.sleep(MERGE_TIME)
-
-    messages = message_buffer[chat_id]
-
-    if not messages:
-        return
-
-    combined_text = "\n".join([m["text"] for m in messages])
-
-    try:
-        translated = ai_translate(combined_text)
-    except Exception as e:
-        print(e)
-        return
-
-    first_message = messages[0]["message"]
-
-    await first_message.reply_text(
-        translated,
-        reply_to_message_id=first_message.message_id
-    )
-
-    message_buffer[chat_id] = []
-
-
-async def translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def translate_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     global bot_enabled
 
     if not bot_enabled:
         return
 
-    if not update.message:
+    message = update.message
+
+    if not message:
         return
 
-    text = update.message.text
-    user_id = update.message.from_user.id
-    chat_id = update.message.chat_id
-
-    if not text:
+    # 忽略图片 sticker 文件
+    if message.photo or message.sticker or message.document or message.video:
         return
 
-    if text.startswith("/"):
+    text = message.text
+
+    if not is_valid_text(text):
         return
+
+    user_id = message.from_user.id
 
     if not rate_limit(user_id):
         return
@@ -146,24 +136,21 @@ async def translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if lang not in ["zh", "vi"]:
         return
 
-    message_buffer[chat_id].append({
-        "text": text,
-        "message": update.message
-    })
+    try:
+        translated, label = translate_text(text, lang)
+    except Exception as e:
+        print(e)
+        return
 
-    if chat_id not in buffer_tasks:
+    if not translated:
+        return
 
-        buffer_tasks[chat_id] = asyncio.create_task(
-            process_buffer(chat_id, context)
-        )
-
-        def done_callback(task):
-            buffer_tasks.pop(chat_id, None)
-
-        buffer_tasks[chat_id].add_done_callback(done_callback)
+    await message.reply_text(
+        f"{label}\n{translated}",
+        reply_to_message_id=message.message_id
+    )
 
 
-# 管理命令
 async def bot_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global bot_enabled
     bot_enabled = True
@@ -177,10 +164,8 @@ async def bot_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def bot_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     status = "开启" if bot_enabled else "关闭"
-
-    await update.message.reply_text(f"机器人状态: {status}")
+    await update.message.reply_text(f"机器人状态：{status}")
 
 
 def main():
@@ -192,10 +177,10 @@ def main():
     app.add_handler(CommandHandler("status", bot_status))
 
     app.add_handler(
-        MessageHandler(filters.TEXT & (~filters.COMMAND), translate)
+        MessageHandler(filters.TEXT & (~filters.COMMAND), translate_handler)
     )
 
-    print("Smart Translation Bot Running...")
+    print("Fast Telegram Translate Bot Running...")
 
     app.run_polling()
 
