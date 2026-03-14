@@ -1,40 +1,31 @@
 import asyncio
-import time
 import re
 import requests
 from collections import defaultdict
-
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    MessageHandler,
-    ContextTypes,
-    filters
-)
-
 from langdetect import detect
 
-# ======================
+from telegram import Update
+from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
+
+# =====================
 # 配置
-# ======================
+# =====================
 
 TELEGRAM_TOKEN = "8387363153:AAFKBHEPDJor5vsTGMM1rrshZU2VYdxw11c"
 
-# 翻译缓存
-translate_cache = {}
-
-# 消息缓冲（用于合并翻译）
-message_buffer = defaultdict(list)
-
-# 缓冲时间（秒）
 BUFFER_TIME = 2
 
+translate_cache = {}
 
-# ======================
-# 判断是否纯表情
-# ======================
+message_buffer = defaultdict(list)
+
+
+# =====================
+# 判断是否表情
+# =====================
 
 def is_emoji_only(text):
+
     emoji_pattern = re.compile(
         "["
         "\U0001F600-\U0001F64F"
@@ -42,26 +33,22 @@ def is_emoji_only(text):
         "\U0001F680-\U0001F6FF"
         "\U0001F1E0-\U0001F1FF"
         "]+",
-        flags=re.UNICODE,
+        flags=re.UNICODE
     )
 
     cleaned = emoji_pattern.sub("", text)
+
     return cleaned.strip() == ""
 
 
-# ======================
-# 翻译函数
-# ======================
+# =====================
+# API1 Argos
+# =====================
 
-def translate(text, target):
+def translate_argos(text, target):
 
-    # 缓存命中
-    cache_key = text + "_" + target
-    if cache_key in translate_cache:
-        return translate_cache[cache_key]
-
-    # 主翻译 API
     try:
+
         url = "https://translate.argosopentech.com/translate"
 
         payload = {
@@ -74,18 +61,26 @@ def translate(text, target):
         r = requests.post(url, data=payload, timeout=8)
 
         if r.status_code == 200:
+
             data = r.json()
 
             if "translatedText" in data:
-                result = data["translatedText"]
-                translate_cache[cache_key] = result
-                return result
+                return data["translatedText"]
 
     except:
         pass
 
-    # 备用 API
+    return None
+
+
+# =====================
+# API2 Libre
+# =====================
+
+def translate_libre(text, target):
+
     try:
+
         url = "https://libretranslate.de/translate"
 
         payload = {
@@ -98,12 +93,41 @@ def translate(text, target):
         r = requests.post(url, data=payload, timeout=8)
 
         if r.status_code == 200:
+
             data = r.json()
 
             if "translatedText" in data:
-                result = data["translatedText"]
-                translate_cache[cache_key] = result
-                return result
+                return data["translatedText"]
+
+    except:
+        pass
+
+    return None
+
+
+# =====================
+# API3 Google
+# =====================
+
+def translate_google(text, target):
+
+    try:
+
+        url = "https://translate.googleapis.com/translate_a/single"
+
+        params = {
+            "client": "gtx",
+            "sl": "auto",
+            "tl": target,
+            "dt": "t",
+            "q": text
+        }
+
+        r = requests.get(url, params=params, timeout=8)
+
+        data = r.json()
+
+        return data[0][0][0]
 
     except:
         pass
@@ -111,9 +135,33 @@ def translate(text, target):
     return text
 
 
-# ======================
+# =====================
+# 三层翻译
+# =====================
+
+def translate(text, target):
+
+    cache_key = text + "_" + target
+
+    if cache_key in translate_cache:
+        return translate_cache[cache_key]
+
+    result = translate_argos(text, target)
+
+    if not result:
+        result = translate_libre(text, target)
+
+    if not result:
+        result = translate_google(text, target)
+
+    translate_cache[cache_key] = result
+
+    return result
+
+
+# =====================
 # 消息处理
-# ======================
+# =====================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -132,11 +180,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_buffer[chat_id].append((msg, text))
 
 
-# ======================
-# 消息缓冲处理
-# ======================
+# =====================
+# 合并翻译
+# =====================
 
-async def process_buffer(app):
+async def process_buffer():
 
     while True:
 
@@ -148,34 +196,36 @@ async def process_buffer(app):
                 continue
 
             items = message_buffer[chat_id]
+
             message_buffer[chat_id] = []
 
             texts = []
             msgs = []
 
             for msg, text in items:
+
                 texts.append(text)
+
                 msgs.append(msg)
 
-            combined_text = "\n".join(texts)
+            combined = "\n".join(texts)
 
             try:
-                lang = detect(combined_text)
+                lang = detect(combined)
             except:
                 continue
 
-            # 中文 -> 越南语
             if lang.startswith("zh"):
-                translated = translate(combined_text, "vi")
 
-            # 越南语 -> 中文
+                translated = translate(combined, "vi")
+
             elif lang == "vi":
-                translated = translate(combined_text, "zh")
+
+                translated = translate(combined, "zh")
 
             else:
                 continue
 
-            # 拆分翻译
             results = translated.split("\n")
 
             for i, msg in enumerate(msgs):
@@ -184,30 +234,34 @@ async def process_buffer(app):
                     continue
 
                 try:
+
                     await msg.reply_text(
                         results[i],
                         reply_to_message_id=msg.message_id
                     )
+
                 except:
                     pass
 
 
-# ======================
-# 主函数
-# ======================
+# =====================
+# 主程序
+# =====================
 
-async def main():
+def main():
 
-    print("Free AI Translate Bot Running...")
+    print("Ultimate Translate Bot Running...")
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
-    asyncio.create_task(process_buffer(app))
+    loop = asyncio.get_event_loop()
 
-    await app.run_polling()
+    loop.create_task(process_buffer())
+
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
